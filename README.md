@@ -1,10 +1,16 @@
 # percollate-proxmox
 
-Single-file installer for [percollate](https://github.com/danburzo/percollate)
-with the web UI (this repository). It creates a Debian 13 LXC on Proxmox VE and
-installs the app **bare-metal** (no Docker): system Chromium, Node.js, npm, and
-a systemd service. The web server and worker run directly on the LXC from
-`/opt/percollate` and expose the UI on port 8080.
+[Percollate](https://github.com/danburzo/percollate) is a command-line tool
+that grabs web pages from (one or more) URLs and bundles them into a
+well-formatted **EPUB, PDF, HTML, or Markdown** document. This repository adds a
+web UI on top of it, so the same conversions can be triggered from the browser
+(`http://<host>:8080`) instead of typing CLI commands.
+
+Single-file installer for percollate with the web UI (this repository). It
+creates a Debian 13 LXC on Proxmox VE and installs the app **bare-metal** (no
+Docker): system Chromium, Node.js, npm, and a systemd service. The web server
+and worker run directly on the LXC from `/opt/percollate` and expose the UI on
+port 8080.
 
 `percollate.sh` is **fully self-contained** — nothing is downloaded from your
 GitHub: the install fragment *and* the entire `web-ui/` (server.js, worker.js,
