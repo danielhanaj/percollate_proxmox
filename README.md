@@ -1,5 +1,8 @@
 # percollate-proxmox
 
+<img width="753" height="691" alt="image" src="https://github.com/user-attachments/assets/1fe3ad6b-a00f-4c09-8191-4c2ecd8e8007" />
+
+
 [Percollate](https://github.com/danburzo/percollate) is a command-line tool
 that grabs web pages from (one or more) URLs and bundles them into a
 well-formatted **EPUB, PDF, HTML, or Markdown** document. This repository adds a
