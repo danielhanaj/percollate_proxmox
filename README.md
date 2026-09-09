@@ -25,12 +25,6 @@ The only network dependency for "obtaining a version" is the official
 var_os='debian' bash -c "$(curl -fsSL https://raw.githubusercontent.com/danielhanaj/percollate_proxmox/refs/heads/main/percollate.sh)"
 ```
 
-or, once hosted anywhere you like (gist, plain web server, repo):
-
-```sh
-bash -c "$(wget -qLO - https://example.com/percollate.sh)"
-```
-
 Choose Default or Advanced, wait for the build, then open
 `http://<lxc-ip>:8080`.
 
