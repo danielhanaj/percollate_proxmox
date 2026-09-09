@@ -16,7 +16,7 @@ The only network dependency for "obtaining a version" is the official
 
 ```sh
 # on the Proxmox VE host
-bash percollate.sh
+var_os='debian' bash -c "$(curl -fsSL https://raw.githubusercontent.com/danielhanaj/percollate_proxmox/refs/heads/main/percollate.sh)"
 ```
 
 or, once hosted anywhere you like (gist, plain web server, repo):
