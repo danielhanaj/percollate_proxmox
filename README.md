@@ -21,6 +21,14 @@ GitHub: the install fragment *and* the entire `web-ui/` (server.js, worker.js,
 The only network dependency for "obtaining a version" is the official
 `danburzo/percollate` GitHub API, read at install time.
 
+This build also adds two worker-level improvements:
+
+- **Readable output names** — generated files are renamed after the article
+  title (spaces become `-`) instead of keeping the internal job id.
+- **Medium friend links** — URLs containing a Medium `?sk=` share key are
+  fetched through Medium's article API, so non-members get the full story
+  instead of the paywalled preview.
+
 ## Usage
 
 ```sh
@@ -57,6 +65,49 @@ re-reads the latest percollate release, runs `npm install`, and restarts.
   `customize`, `cleanup_lxc`, `msg_*`. No Docker anywhere — this aligns with the
   community-scripts policy *"We do NOT use Docker for our installation scripts."*
 
+## Output names
+
+After percollate produces a file, the worker renames it after the article title
+instead of leaving the job id in the name:
+
+- accents are folded and quotes removed
+- runs of spaces/punctuation become a single `-`
+- names are truncated to 80 characters
+- `-2`, `-3`, … are appended when the name already exists in
+  `/var/lib/percollate`
+
+For a multi-URL job without a user-supplied title, the first article's title is
+used and `-and-N-more` is appended. With `--individual`, each file uses its own
+article title.
+
+## Medium friend links
+
+A Medium friend link carries a share key in the query string:
+
+```
+https://blog.example.com/some-story-4974cb0cf661?sk=b6a...
+```
+
+Plain HTTP clients (including percollate's `node-fetch`) receive Medium's
+paywalled preview for these URLs. The worker recognizes the `?sk=` parameter,
+extracts the 12-character post id, and requests the unlocked article from
+Medium's JSON API:
+
+```
+https://medium.com/_/api/posts/<postId>?sk=<shareKey>
+```
+
+It converts the returned body model (paragraphs, headings, images, links,
+quotes, code blocks, and lists) into a minimal HTML document, then lets
+percollate format that document. The original URL is used as the base URL so
+relative links still resolve.
+
+This does not bypass Medium's paywall: the `sk` value is the author-issued
+friend key, and Medium returns the full body only while that key is valid.
+
+If the share key is expired or revoked, or the API cannot be reached, the
+worker logs the reason and falls back to percollate's normal direct fetch.
+
 ## Native stack
 
 | Component  | Choice | Why |
@@ -71,7 +122,8 @@ re-reads the latest percollate release, runs `npm install`, and restarts.
 The runtime equals the Docker image's `NO_SANDBOX=1` mode (verified working,
 including the two-URL EPUB case): unprivileged LXCs block user namespaces, so
 `NO_SANDBOX=1` passes `--no-sandbox` to Chromium. Output files land in
-`/var/lib/percollate` and are streamed back through the web UI.
+`/var/lib/percollate` under their article-derived names and are streamed back
+through the web UI.
 
 ## Regenerating the installer
 
@@ -86,6 +138,11 @@ bash proxmox-lxc/build-percollate.sh   # rewrites proxmox-lxc/percollate.sh
 Don't hand-edit the embedded blocks in `percollate.sh`; edit `web-ui/` and the
 fragment/helper scaffolding in `build-percollate.sh`, then re-run.
 
+The title-based filenames and Medium friend-link handling live in the embedded
+`worker.js` block. If you regenerate from `web-ui/`, port those changes to
+`web-ui/worker.js` first; otherwise the regenerated installer will overwrite
+them.
+
 ## Layout
 
 ```
@@ -96,6 +153,9 @@ proxmox-lxc/
 └── percollate.sh         # the whole installer (host + install fragment +
                           #   embedded web-ui sources) — the only file you run
 ```
+
+The runtime only needs `percollate.sh`; `build-percollate.sh` and `web-ui/` are
+development-time files used to regenerate it.
 
 ## Notes
 
@@ -108,3 +168,8 @@ proxmox-lxc/
 - Inside the embedded fragment use `${APPLICATION}` (exported by the engine from
   the host `APP` variable) — plain `$APP` is unbound there and aborts the
   install under `set -u`.
+- Medium friend links need a valid, unexpired `sk` key. Expired links still
+  convert, but only the public preview is available.
+- Friend-link API requests are tried with Node's built-in `fetch`; if
+  Cloudflare rejects that request, the worker retries inside the installed
+  Chromium. Both paths use the same browser user agent as normal conversions.
