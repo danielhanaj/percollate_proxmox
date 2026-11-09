@@ -88,6 +88,17 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
 	.filter(Boolean);
 const NO_SANDBOX = process.env.NO_SANDBOX === '1';
 
+/*
+ * Cloudflare-fronted sites (Medium, itnext.io, …) reject percollate's default
+ * "percollate/<version>" user-agent with HTTP 403; Readability then gets no
+ * article and percollate throws "Cannot read properties of undefined (reading
+ * 'querySelectorAll')", producing an empty EPUB. Present a normal browser UA.
+ * The worker inherits this via process.env and percollate's patched index.js
+ * reads PERCOLLATE_USER_AGENT.
+ */
+process.env.PERCOLLATE_USER_AGENT ||=
+	'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
+
 const FORMATS = ['pdf', 'epub', 'html', 'md'];
 const EXT = { pdf: 'pdf', epub: 'epub', html: 'html', md: 'md' };
 const MAX_BODY_BYTES = 1_000_000;
@@ -250,9 +261,14 @@ function run(job) {
 			clearTimeout(timer);
 			job.finishedAt = Date.now();
 			if (result?.ok === true) {
-				const stat = await fsp.stat(outPath).catch(() => null);
+				// The worker renames the generated file after the article title
+				// (spaces become "-"); honour the name it reports.
+				const filename = path.basename(result.filename || outPath);
+				const stat = await fsp
+					.stat(path.join(OUTPUT_DIR, filename))
+					.catch(() => null);
 				job.output = {
-					filename: path.basename(outPath),
+					filename,
 					bytes: stat?.size || 0,
 					url: `/api/jobs/${job.id}/download`
 				};
@@ -454,8 +470,15 @@ cat >/opt/percollate/worker.js <<'PERCOLLATE_UI_BELOW'
  * Writes percollate's progress lines to stdout/stderr (captured as job logs by
  * the server) and finishes with a single JSON result line on stdout:
  *   {"ok":true}  or  {"ok":false,"error":"..."}
+ *
+ * Medium friend links (?sk=…) are fetched through Medium's JSON API and
+ * converted from a local HTML copy, because the public page shows the
+ * paywalled preview to non-browser clients.
  */
 import * as percollate from 'percollate';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const FORMATS = {
 	pdf: percollate.pdf,
@@ -466,19 +489,501 @@ const FORMATS = {
 
 let spec = '';
 
+const BROWSER_UA =
+	process.env.PERCOLLATE_USER_AGENT ||
+	'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
+
+/*
+ * A Medium friend link (?sk=…) points at a story whose body is unlocked for
+ * that share key. The public HTML is still the paywalled preview for plain
+ * HTTP clients, but Medium's JSON API returns the complete body model:
+ *   https://medium.com/_/api/posts/<postId>?sk=<shareKey>
+ * Return the 12-character post id, or null when this is not a friend link.
+ */
+function mediumPostId(raw) {
+	try {
+		const url = new URL(raw);
+		if (!url.searchParams.has('sk')) return null;
+		const match =
+			url.pathname.match(/-([0-9a-f]{12})\/?$/i) ||
+			url.pathname.match(/\/([0-9a-f]{12})\/?$/i);
+		return match ? match[1].toLowerCase() : null;
+	} catch {
+		return null;
+	}
+}
+
+const MARKUP_TAGS = { 1: 'strong', 2: 'em', 3: 'a', 10: 'code' };
+
+function escapeHtml(value) {
+	return String(value == null ? '' : value)
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;');
+}
+
+function escapeAttr(value) {
+	return escapeHtml(value).replace(/'/g, '&#39;');
+}
+
+function openMarkup(markup) {
+	if (markup.tag === 'a') {
+		return `<a href="${escapeAttr(safeHref(markup.href))}">`;
+	}
+	return `<${markup.tag}>`;
+}
+
+function safeHref(value) {
+	const href = String(value || '').trim();
+	if (!href) return '#';
+	if (
+		/^(https?:)?\/\//i.test(href) ||
+		href.startsWith('/') ||
+		href.startsWith('#') ||
+		href.startsWith('mailto:')
+	) {
+		return href;
+	}
+	return '#';
+}
+
+function prepareMarkups(text, markups) {
+	const max = text.length;
+	return (markups || [])
+		.map((raw, order) => {
+			const type = Number(raw && raw.type);
+			const tag = MARKUP_TAGS[type];
+			if (!tag) return null;
+			let start = Number(raw.start);
+			let end = Number(raw.end);
+			if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+			start = Math.max(0, Math.min(max, start));
+			end = Math.max(0, Math.min(max, end));
+			if (end <= start) return null;
+			return { type, tag, start, end, order, href: raw.href };
+		})
+		.filter(Boolean);
+}
+
+/* Apply Medium inline markups (bold/italic/link/code) to a paragraph's text. */
+function renderMarkedText(text, markups, from = 0, to = text.length) {
+	const candidates = markups.filter(m => m.start >= from && m.end <= to);
+	const contains = (outer, inner) =>
+		outer !== inner &&
+		outer.start <= inner.start &&
+		outer.end >= inner.end &&
+		(outer.start < inner.start ||
+			outer.end > inner.end ||
+			(outer.start === inner.start && outer.end === inner.end && outer.order < inner.order));
+	const tops = candidates.filter(m => !candidates.some(o => contains(o, m)));
+	tops.sort((a, b) => a.start - b.start || b.end - a.end);
+	let out = '';
+	let pos = from;
+	for (const markup of tops) {
+		if (markup.start < pos) continue;
+		out += escapeHtml(text.slice(pos, markup.start));
+		out += openMarkup(markup);
+		out += renderMarkedText(
+			text,
+			candidates.filter(
+				m => m !== markup && m.start >= markup.start && m.end <= markup.end
+			),
+			markup.start,
+			markup.end
+		);
+		out += `</${markup.tag}>`;
+		pos = markup.end;
+	}
+	out += escapeHtml(text.slice(pos, to));
+	return out;
+}
+
+function renderParagraph(paragraph) {
+	const text = String((paragraph && paragraph.text) || '');
+	const markups = prepareMarkups(text, paragraph && paragraph.markups);
+	const inner = () => renderMarkedText(text, markups);
+	switch (Number(paragraph && paragraph.type)) {
+		case 4: {
+			const metadata = (paragraph && paragraph.metadata) || {};
+			const id = metadata.id;
+			if (!id) return '';
+			const src = /^https?:\/\//i.test(id)
+				? id
+				: `https://miro.medium.com/v2/resize:fit:1400/${id}`;
+			const alt = metadata.alt || '';
+			return `<figure><img src="${escapeAttr(src)}" alt="${escapeAttr(alt)}" /></figure>\n`;
+		}
+		case 3:
+			return text.trim() ? `<h2>${inner()}</h2>\n` : '';
+		case 13:
+			return text.trim() ? `<h3>${inner()}</h3>\n` : '';
+		case 6:
+			return text.trim() ? `<blockquote>${inner()}</blockquote>\n` : '';
+		case 8:
+			return text.trim() ? `<pre><code>${escapeHtml(text)}</code></pre>\n` : '';
+		case 9:
+			return text.trim() ? `<ul><li>${inner()}</li></ul>\n` : '';
+		case 10:
+		case 14:
+			return text.trim() ? `<ol><li>${inner()}</li></ol>\n` : '';
+		case 7:
+			return '<hr />\n';
+		default:
+			return text.trim() ? `<p>${inner()}</p>\n` : '';
+	}
+}
+
+function renderMediumBody(post, paragraphs) {
+	const title = String(post.title || '').trim();
+	const subtitle = String((post.content && post.content.subtitle) || '').trim();
+	let skippedTitle = false;
+	let skippedSubtitle = false;
+	const blocks = [];
+	let list = null;
+
+	const flushList = () => {
+		if (list) {
+			blocks.push(`<${list.tag}>${list.items.join('')}</${list.tag}>\n`);
+			list = null;
+		}
+	};
+
+	for (const paragraph of paragraphs) {
+		const text = String((paragraph && paragraph.text) || '').trim();
+		if (
+			!skippedTitle &&
+			title &&
+			Number(paragraph && paragraph.type) === 3 &&
+			text === title
+		) {
+			skippedTitle = true;
+			continue;
+		}
+		if (!skippedSubtitle && subtitle && text === subtitle) {
+			skippedSubtitle = true;
+			continue;
+		}
+
+		// Medium emits one paragraph per list item; merge consecutive items
+		// so the reader gets a single <ul>/<ol> instead of many tiny lists.
+		const type = Number(paragraph && paragraph.type);
+		const tag = type === 9 ? 'ul' : type === 10 || type === 14 ? 'ol' : null;
+		if (tag) {
+			if (list && list.tag !== tag) flushList();
+			if (!list) list = { tag, items: [] };
+			if (text) {
+				const markups = prepareMarkups(
+					String(paragraph.text || ''),
+					paragraph.markups
+				);
+				list.items.push(
+					`<li>${renderMarkedText(String(paragraph.text || ''), markups)}</li>`
+				);
+			}
+			continue;
+		}
+
+		flushList();
+		const block = renderParagraph(paragraph);
+		if (block) blocks.push(block);
+	}
+	flushList();
+	return blocks.join('');
+}
+
+function renderMediumPage(post, paragraphs, sourceUrl) {
+	const title = String(post.title || 'Medium article').trim();
+	const subtitle = String((post.content && post.content.subtitle) || '').trim();
+	const rawPublished = Number(post.firstPublishedAt || post.latestPublishedAt || 0);
+	const publishedAt =
+		Number.isFinite(rawPublished) && rawPublished > 0
+			? rawPublished < 1e12
+				? rawPublished * 1000
+				: rawPublished
+			: 0;
+	const published = publishedAt ? new Date(publishedAt).toISOString() : '';
+	const lines = [
+		'<!doctype html>',
+		'<html>',
+		'<head>',
+		'\t<meta charset="utf-8" />',
+		`\t<title>${escapeHtml(title)}</title>`,
+		`\t<meta property="og:title" content="${escapeAttr(title)}" />`,
+		`\t<meta property="og:url" content="${escapeAttr(sourceUrl)}" />`
+	];
+	if (subtitle) {
+		lines.push(`\t<meta property="og:description" content="${escapeAttr(subtitle)}" />`);
+	}
+	if (published) {
+		lines.push(
+			`\t<meta property="article:published_time" content="${escapeAttr(published)}" />`
+		);
+	}
+	lines.push(
+		'</head>',
+		'<body>',
+		'\t<article>',
+		`\t\t<h1>${escapeHtml(title)}</h1>`,
+		subtitle
+			? `\t\t<p class="subtitle"><strong>${escapeHtml(subtitle)}</strong></p>`
+			: '',
+		renderMediumBody(post, paragraphs),
+		'\t</article>',
+		'</body>',
+		'</html>',
+		''
+	);
+	return lines.filter(line => line !== '').join('\n');
+}
+
+/* Fetch the unlocked body model from Medium's API, then cache it as HTML. */
+async function fetchMediumText(url) {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 45_000);
+	let response;
+	try {
+		response = await fetch(url, {
+			headers: {
+				'user-agent': BROWSER_UA,
+				accept: 'application/json, text/plain, */*',
+				'accept-language': 'en-US,en;q=0.9',
+				referer: 'https://medium.com/'
+			},
+			redirect: 'follow',
+			signal: controller.signal
+		});
+	} finally {
+		clearTimeout(timer);
+	}
+	if (!response.ok) {
+		throw new Error(`HTTP ${response.status}`);
+	}
+	return response.text();
+}
+
+/*
+ * Cloudflare sometimes rejects Node's TLS fingerprint even when the container
+ * can reach Medium. Chromium is already installed for PDF rendering, so retry
+ * the API request there and read the raw response body.
+ */
+async function fetchMediumTextWithBrowser(url, options) {
+	const { default: puppeteer } = await import('puppeteer');
+	const args = ['--disable-dev-shm-usage'];
+	if (options && options.sandbox === false) {
+		args.push('--no-sandbox', '--disable-setuid-sandbox');
+	}
+	const browser = await puppeteer.launch({
+		headless: true,
+		executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+		args
+	});
+	try {
+		const page = await browser.newPage();
+		await page.setUserAgent(BROWSER_UA);
+		await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+
+		// Preferred: navigate straight to the API and read the response.
+		try {
+			const response = await page.goto(url, {
+				waitUntil: 'domcontentloaded',
+				timeout: 60_000
+			});
+			if (response) {
+				const body = await response.text();
+				if (body.includes('"payload"')) return body;
+			}
+		} catch {
+			// Fall through to the in-page request below.
+		}
+
+		// Some Cloudflare setups reject a direct navigation to /_/api but
+		// allow the site itself. Load medium.com first, then request the API
+		// from that page so cookies and Referer match a normal browser.
+		await page
+			.goto('https://medium.com/', {
+				waitUntil: 'domcontentloaded',
+				timeout: 60_000
+			})
+			.catch(() => {});
+		return await page.evaluate(async api => {
+			const response = await fetch(api, {
+				headers: { accept: 'application/json' },
+				credentials: 'include'
+			});
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			return response.text();
+		}, url);
+	} finally {
+		await browser.close().catch(() => {});
+	}
+}
+
+function parseMediumPost(body) {
+	// Medium prefixes the JSON with a JSON-hijacking guard: ])}while(1);</x>
+	const start = body.indexOf('{');
+	if (start < 0) throw new Error('unexpected response');
+	const data = JSON.parse(body.slice(start));
+	const post = data && data.payload && data.payload.value;
+	if (!post) throw new Error('unexpected response');
+	if (post.isLockedPreviewOnly) {
+		throw new Error('friend link is locked or has expired');
+	}
+	const paragraphs =
+		post.content &&
+		post.content.bodyModel &&
+		post.content.bodyModel.paragraphs;
+	if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
+		throw new Error('no article body');
+	}
+	return post;
+}
+
+async function fetchMediumPost(raw, options) {
+	const id = mediumPostId(raw);
+	const shareKey = new URL(raw).searchParams.get('sk');
+	const api = `https://medium.com/_/api/posts/${id}?sk=${encodeURIComponent(shareKey)}`;
+
+	let post;
+	try {
+		post = parseMediumPost(await fetchMediumText(api));
+	} catch (err) {
+		if (/locked or has expired/.test(err.message)) throw err;
+		process.stderr.write(
+			`Medium API request failed (${err.message}); retrying in Chromium\n`
+		);
+		post = parseMediumPost(await fetchMediumTextWithBrowser(api, options));
+	}
+
+	const paragraphs = post.content.bodyModel.paragraphs;
+	const html = renderMediumPage(post, paragraphs, raw);
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'percollate-'));
+	const file = path.join(dir, 'page.html');
+	await fs.promises.writeFile(file, html);
+	return { file, dir, url: raw };
+}
+
+async function removeDirs(dirs) {
+	for (const dir of dirs) {
+		await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+	}
+}
+
+/*
+ * Turn an article title into a file name: strip accents, drop quotes, and
+ * replace every run of other characters (spaces included) with a single "-".
+ * "Don’t Panic: A Guide" becomes "Dont-Panic-A-Guide".
+ */
+function slugifyTitle(raw) {
+	return String(raw || '')
+		.normalize('NFKD')
+		.replace(/[\u0300-\u036f]/g, '')
+		.replace(/['’`]/g, '')
+		.replace(/[^A-Za-z0-9]+/g, '-')
+		.replace(/-{2,}/g, '-')
+		.replace(/^-+|-+$/g, '')
+		.slice(0, 80)
+		.replace(/-+$/, '');
+}
+
+/* Append -2, -3, … when a file with that name is already in the directory. */
+function uniqueName(dir, base, ext) {
+	let name = `${base}${ext}`;
+	let n = 2;
+	while (fs.existsSync(path.join(dir, name))) {
+		name = `${base}-${n}${ext}`;
+		n += 1;
+	}
+	return name;
+}
+
+/*
+ * percollate is told to write "<job-id>.<ext>" ("<job-id>-<slug>.<ext>" for
+ * individual files). After it has run we know the article title(s), so rename
+ * the output after the title and report the final name back to the server.
+ */
+function renameOutput(job, result) {
+	const ext = path.extname(job.options.output);
+	const dir = path.dirname(job.options.output);
+	const jobBase = path.basename(job.options.output, ext);
+	const items = result?.items || [];
+	let filename = path.basename(job.options.output);
+
+	if (job.options.individual) {
+		const prefix = `${jobBase}-`;
+		const renamed = fs
+			.readdirSync(dir)
+			.filter(f => f.startsWith(prefix) && f.endsWith(ext))
+			.map(f => {
+				const base = path.basename(f, ext).slice(prefix.length);
+				const target = uniqueName(dir, slugifyTitle(base) || jobBase, ext);
+				fs.renameSync(path.join(dir, f), path.join(dir, target));
+				return target;
+			});
+		if (renamed.length) filename = renamed[0];
+		return filename;
+	}
+
+	let base = slugifyTitle(job.options.title || items[0]?.title);
+	if (!base) {
+		base = jobBase;
+	} else if (items.length > 1 && !job.options.title) {
+		base += `-and-${items.length - 1}-more`;
+	}
+
+	const source = path.join(dir, path.basename(job.options.output));
+	if (fs.existsSync(source)) {
+		filename = uniqueName(dir, base, ext);
+		fs.renameSync(source, path.join(dir, filename));
+	}
+	return filename;
+}
+
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => {
 	spec += chunk;
 });
 process.stdin.on('end', async () => {
+	const tempDirs = [];
 	try {
 		const job = JSON.parse(spec);
 		const fn = FORMATS[job.format];
 		if (!fn) throw new Error(`Unknown format: ${job.format}`);
-		await fn(job.urls, job.options);
-		process.stdout.write('\n{"ok":true}\n');
+
+		// Medium friend links (?sk=…) unlock the story through Medium's own
+		// JSON API. Build a local HTML copy from that response so percollate
+		// sees the full article instead of the paywalled preview.
+		const urls = [...job.urls];
+		const preferredUrls = [];
+		for (let i = 0; i < urls.length; i++) {
+			if (!mediumPostId(urls[i])) continue;
+			process.stderr.write(`Fetching Medium friend link: ${urls[i]}\n`);
+			try {
+				const fetched = await fetchMediumPost(urls[i], job.options);
+				urls[i] = fetched.file;
+				preferredUrls[i] = fetched.url;
+				tempDirs.push(fetched.dir);
+				process.stderr.write('Friend link unlocked via Medium API\n');
+			} catch (err) {
+				process.stderr.write(
+					`Friend-link fetch failed (${err.message}); using direct fetch\n`
+				);
+			}
+		}
+
+		const runOptions = { ...job.options };
+		// percollate uses options.url[i] as the base URL when the input is a
+		// local file, so relative images/links still resolve to the article.
+		if (preferredUrls.some(Boolean)) runOptions.url = preferredUrls;
+
+		const result = await fn(urls, runOptions);
+		const filename = renameOutput(job, result);
+		await removeDirs(tempDirs);
+		process.stderr.write(`Saved as: ${filename}\n`);
+		process.stdout.write(`\n${JSON.stringify({ ok: true, filename })}\n`);
 		process.exit(0);
 	} catch (err) {
+		await removeDirs(tempDirs);
 		const msg = String((err && err.stack) || err || 'Unknown error');
 		process.stdout.write(`\n{"ok":false,"error":${JSON.stringify(msg)}}\n`);
 		process.exit(1);
@@ -897,6 +1402,12 @@ cat >package.json <<NPM_MANIFEST
 }
 NPM_MANIFEST
 PUPPETEER_SKIP_DOWNLOAD=true $STD npm install --no-audit --no-fund
+# Make percollate's user-agent overridable via PERCOLLATE_USER_AGENT (set by
+# server.js): its hard-coded "percollate/<version>" UA is rejected with HTTP 403
+# by Cloudflare-protected sites such as itnext.io/Medium, yielding empty output.
+if grep -q 'let UA = `percollate/${pkg.version}`;' node_modules/percollate/index.js 2>/dev/null; then
+  sed -i 's#^let UA = `percollate/${pkg.version}`;#let UA = process.env.PERCOLLATE_USER_AGENT || `percollate/${pkg.version}`;#' node_modules/percollate/index.js
+fi
 chown -R percollate:percollate /opt/percollate
 msg_ok "Installed Application"
 
@@ -1019,6 +1530,17 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
 	.map(s => s.trim().toLowerCase())
 	.filter(Boolean);
 const NO_SANDBOX = process.env.NO_SANDBOX === '1';
+
+/*
+ * Cloudflare-fronted sites (Medium, itnext.io, …) reject percollate's default
+ * "percollate/<version>" user-agent with HTTP 403; Readability then gets no
+ * article and percollate throws "Cannot read properties of undefined (reading
+ * 'querySelectorAll')", producing an empty EPUB. Present a normal browser UA.
+ * The worker inherits this via process.env and percollate's patched index.js
+ * reads PERCOLLATE_USER_AGENT.
+ */
+process.env.PERCOLLATE_USER_AGENT ||=
+	'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
 
 const FORMATS = ['pdf', 'epub', 'html', 'md'];
 const EXT = { pdf: 'pdf', epub: 'epub', html: 'html', md: 'md' };
@@ -1182,9 +1704,14 @@ function run(job) {
 			clearTimeout(timer);
 			job.finishedAt = Date.now();
 			if (result?.ok === true) {
-				const stat = await fsp.stat(outPath).catch(() => null);
+				// The worker renames the generated file after the article title
+				// (spaces become "-"); honour the name it reports.
+				const filename = path.basename(result.filename || outPath);
+				const stat = await fsp
+					.stat(path.join(OUTPUT_DIR, filename))
+					.catch(() => null);
 				job.output = {
-					filename: path.basename(outPath),
+					filename,
 					bytes: stat?.size || 0,
 					url: `/api/jobs/${job.id}/download`
 				};
@@ -1386,8 +1913,15 @@ cat >/opt/percollate/worker.js <<'PERCOLLATE_UI_BELOW'
  * Writes percollate's progress lines to stdout/stderr (captured as job logs by
  * the server) and finishes with a single JSON result line on stdout:
  *   {"ok":true}  or  {"ok":false,"error":"..."}
+ *
+ * Medium friend links (?sk=…) are fetched through Medium's JSON API and
+ * converted from a local HTML copy, because the public page shows the
+ * paywalled preview to non-browser clients.
  */
 import * as percollate from 'percollate';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const FORMATS = {
 	pdf: percollate.pdf,
@@ -1398,19 +1932,501 @@ const FORMATS = {
 
 let spec = '';
 
+const BROWSER_UA =
+	process.env.PERCOLLATE_USER_AGENT ||
+	'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
+
+/*
+ * A Medium friend link (?sk=…) points at a story whose body is unlocked for
+ * that share key. The public HTML is still the paywalled preview for plain
+ * HTTP clients, but Medium's JSON API returns the complete body model:
+ *   https://medium.com/_/api/posts/<postId>?sk=<shareKey>
+ * Return the 12-character post id, or null when this is not a friend link.
+ */
+function mediumPostId(raw) {
+	try {
+		const url = new URL(raw);
+		if (!url.searchParams.has('sk')) return null;
+		const match =
+			url.pathname.match(/-([0-9a-f]{12})\/?$/i) ||
+			url.pathname.match(/\/([0-9a-f]{12})\/?$/i);
+		return match ? match[1].toLowerCase() : null;
+	} catch {
+		return null;
+	}
+}
+
+const MARKUP_TAGS = { 1: 'strong', 2: 'em', 3: 'a', 10: 'code' };
+
+function escapeHtml(value) {
+	return String(value == null ? '' : value)
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;');
+}
+
+function escapeAttr(value) {
+	return escapeHtml(value).replace(/'/g, '&#39;');
+}
+
+function openMarkup(markup) {
+	if (markup.tag === 'a') {
+		return `<a href="${escapeAttr(safeHref(markup.href))}">`;
+	}
+	return `<${markup.tag}>`;
+}
+
+function safeHref(value) {
+	const href = String(value || '').trim();
+	if (!href) return '#';
+	if (
+		/^(https?:)?\/\//i.test(href) ||
+		href.startsWith('/') ||
+		href.startsWith('#') ||
+		href.startsWith('mailto:')
+	) {
+		return href;
+	}
+	return '#';
+}
+
+function prepareMarkups(text, markups) {
+	const max = text.length;
+	return (markups || [])
+		.map((raw, order) => {
+			const type = Number(raw && raw.type);
+			const tag = MARKUP_TAGS[type];
+			if (!tag) return null;
+			let start = Number(raw.start);
+			let end = Number(raw.end);
+			if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+			start = Math.max(0, Math.min(max, start));
+			end = Math.max(0, Math.min(max, end));
+			if (end <= start) return null;
+			return { type, tag, start, end, order, href: raw.href };
+		})
+		.filter(Boolean);
+}
+
+/* Apply Medium inline markups (bold/italic/link/code) to a paragraph's text. */
+function renderMarkedText(text, markups, from = 0, to = text.length) {
+	const candidates = markups.filter(m => m.start >= from && m.end <= to);
+	const contains = (outer, inner) =>
+		outer !== inner &&
+		outer.start <= inner.start &&
+		outer.end >= inner.end &&
+		(outer.start < inner.start ||
+			outer.end > inner.end ||
+			(outer.start === inner.start && outer.end === inner.end && outer.order < inner.order));
+	const tops = candidates.filter(m => !candidates.some(o => contains(o, m)));
+	tops.sort((a, b) => a.start - b.start || b.end - a.end);
+	let out = '';
+	let pos = from;
+	for (const markup of tops) {
+		if (markup.start < pos) continue;
+		out += escapeHtml(text.slice(pos, markup.start));
+		out += openMarkup(markup);
+		out += renderMarkedText(
+			text,
+			candidates.filter(
+				m => m !== markup && m.start >= markup.start && m.end <= markup.end
+			),
+			markup.start,
+			markup.end
+		);
+		out += `</${markup.tag}>`;
+		pos = markup.end;
+	}
+	out += escapeHtml(text.slice(pos, to));
+	return out;
+}
+
+function renderParagraph(paragraph) {
+	const text = String((paragraph && paragraph.text) || '');
+	const markups = prepareMarkups(text, paragraph && paragraph.markups);
+	const inner = () => renderMarkedText(text, markups);
+	switch (Number(paragraph && paragraph.type)) {
+		case 4: {
+			const metadata = (paragraph && paragraph.metadata) || {};
+			const id = metadata.id;
+			if (!id) return '';
+			const src = /^https?:\/\//i.test(id)
+				? id
+				: `https://miro.medium.com/v2/resize:fit:1400/${id}`;
+			const alt = metadata.alt || '';
+			return `<figure><img src="${escapeAttr(src)}" alt="${escapeAttr(alt)}" /></figure>\n`;
+		}
+		case 3:
+			return text.trim() ? `<h2>${inner()}</h2>\n` : '';
+		case 13:
+			return text.trim() ? `<h3>${inner()}</h3>\n` : '';
+		case 6:
+			return text.trim() ? `<blockquote>${inner()}</blockquote>\n` : '';
+		case 8:
+			return text.trim() ? `<pre><code>${escapeHtml(text)}</code></pre>\n` : '';
+		case 9:
+			return text.trim() ? `<ul><li>${inner()}</li></ul>\n` : '';
+		case 10:
+		case 14:
+			return text.trim() ? `<ol><li>${inner()}</li></ol>\n` : '';
+		case 7:
+			return '<hr />\n';
+		default:
+			return text.trim() ? `<p>${inner()}</p>\n` : '';
+	}
+}
+
+function renderMediumBody(post, paragraphs) {
+	const title = String(post.title || '').trim();
+	const subtitle = String((post.content && post.content.subtitle) || '').trim();
+	let skippedTitle = false;
+	let skippedSubtitle = false;
+	const blocks = [];
+	let list = null;
+
+	const flushList = () => {
+		if (list) {
+			blocks.push(`<${list.tag}>${list.items.join('')}</${list.tag}>\n`);
+			list = null;
+		}
+	};
+
+	for (const paragraph of paragraphs) {
+		const text = String((paragraph && paragraph.text) || '').trim();
+		if (
+			!skippedTitle &&
+			title &&
+			Number(paragraph && paragraph.type) === 3 &&
+			text === title
+		) {
+			skippedTitle = true;
+			continue;
+		}
+		if (!skippedSubtitle && subtitle && text === subtitle) {
+			skippedSubtitle = true;
+			continue;
+		}
+
+		// Medium emits one paragraph per list item; merge consecutive items
+		// so the reader gets a single <ul>/<ol> instead of many tiny lists.
+		const type = Number(paragraph && paragraph.type);
+		const tag = type === 9 ? 'ul' : type === 10 || type === 14 ? 'ol' : null;
+		if (tag) {
+			if (list && list.tag !== tag) flushList();
+			if (!list) list = { tag, items: [] };
+			if (text) {
+				const markups = prepareMarkups(
+					String(paragraph.text || ''),
+					paragraph.markups
+				);
+				list.items.push(
+					`<li>${renderMarkedText(String(paragraph.text || ''), markups)}</li>`
+				);
+			}
+			continue;
+		}
+
+		flushList();
+		const block = renderParagraph(paragraph);
+		if (block) blocks.push(block);
+	}
+	flushList();
+	return blocks.join('');
+}
+
+function renderMediumPage(post, paragraphs, sourceUrl) {
+	const title = String(post.title || 'Medium article').trim();
+	const subtitle = String((post.content && post.content.subtitle) || '').trim();
+	const rawPublished = Number(post.firstPublishedAt || post.latestPublishedAt || 0);
+	const publishedAt =
+		Number.isFinite(rawPublished) && rawPublished > 0
+			? rawPublished < 1e12
+				? rawPublished * 1000
+				: rawPublished
+			: 0;
+	const published = publishedAt ? new Date(publishedAt).toISOString() : '';
+	const lines = [
+		'<!doctype html>',
+		'<html>',
+		'<head>',
+		'\t<meta charset="utf-8" />',
+		`\t<title>${escapeHtml(title)}</title>`,
+		`\t<meta property="og:title" content="${escapeAttr(title)}" />`,
+		`\t<meta property="og:url" content="${escapeAttr(sourceUrl)}" />`
+	];
+	if (subtitle) {
+		lines.push(`\t<meta property="og:description" content="${escapeAttr(subtitle)}" />`);
+	}
+	if (published) {
+		lines.push(
+			`\t<meta property="article:published_time" content="${escapeAttr(published)}" />`
+		);
+	}
+	lines.push(
+		'</head>',
+		'<body>',
+		'\t<article>',
+		`\t\t<h1>${escapeHtml(title)}</h1>`,
+		subtitle
+			? `\t\t<p class="subtitle"><strong>${escapeHtml(subtitle)}</strong></p>`
+			: '',
+		renderMediumBody(post, paragraphs),
+		'\t</article>',
+		'</body>',
+		'</html>',
+		''
+	);
+	return lines.filter(line => line !== '').join('\n');
+}
+
+/* Fetch the unlocked body model from Medium's API, then cache it as HTML. */
+async function fetchMediumText(url) {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 45_000);
+	let response;
+	try {
+		response = await fetch(url, {
+			headers: {
+				'user-agent': BROWSER_UA,
+				accept: 'application/json, text/plain, */*',
+				'accept-language': 'en-US,en;q=0.9',
+				referer: 'https://medium.com/'
+			},
+			redirect: 'follow',
+			signal: controller.signal
+		});
+	} finally {
+		clearTimeout(timer);
+	}
+	if (!response.ok) {
+		throw new Error(`HTTP ${response.status}`);
+	}
+	return response.text();
+}
+
+/*
+ * Cloudflare sometimes rejects Node's TLS fingerprint even when the container
+ * can reach Medium. Chromium is already installed for PDF rendering, so retry
+ * the API request there and read the raw response body.
+ */
+async function fetchMediumTextWithBrowser(url, options) {
+	const { default: puppeteer } = await import('puppeteer');
+	const args = ['--disable-dev-shm-usage'];
+	if (options && options.sandbox === false) {
+		args.push('--no-sandbox', '--disable-setuid-sandbox');
+	}
+	const browser = await puppeteer.launch({
+		headless: true,
+		executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+		args
+	});
+	try {
+		const page = await browser.newPage();
+		await page.setUserAgent(BROWSER_UA);
+		await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+
+		// Preferred: navigate straight to the API and read the response.
+		try {
+			const response = await page.goto(url, {
+				waitUntil: 'domcontentloaded',
+				timeout: 60_000
+			});
+			if (response) {
+				const body = await response.text();
+				if (body.includes('"payload"')) return body;
+			}
+		} catch {
+			// Fall through to the in-page request below.
+		}
+
+		// Some Cloudflare setups reject a direct navigation to /_/api but
+		// allow the site itself. Load medium.com first, then request the API
+		// from that page so cookies and Referer match a normal browser.
+		await page
+			.goto('https://medium.com/', {
+				waitUntil: 'domcontentloaded',
+				timeout: 60_000
+			})
+			.catch(() => {});
+		return await page.evaluate(async api => {
+			const response = await fetch(api, {
+				headers: { accept: 'application/json' },
+				credentials: 'include'
+			});
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			return response.text();
+		}, url);
+	} finally {
+		await browser.close().catch(() => {});
+	}
+}
+
+function parseMediumPost(body) {
+	// Medium prefixes the JSON with a JSON-hijacking guard: ])}while(1);</x>
+	const start = body.indexOf('{');
+	if (start < 0) throw new Error('unexpected response');
+	const data = JSON.parse(body.slice(start));
+	const post = data && data.payload && data.payload.value;
+	if (!post) throw new Error('unexpected response');
+	if (post.isLockedPreviewOnly) {
+		throw new Error('friend link is locked or has expired');
+	}
+	const paragraphs =
+		post.content &&
+		post.content.bodyModel &&
+		post.content.bodyModel.paragraphs;
+	if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
+		throw new Error('no article body');
+	}
+	return post;
+}
+
+async function fetchMediumPost(raw, options) {
+	const id = mediumPostId(raw);
+	const shareKey = new URL(raw).searchParams.get('sk');
+	const api = `https://medium.com/_/api/posts/${id}?sk=${encodeURIComponent(shareKey)}`;
+
+	let post;
+	try {
+		post = parseMediumPost(await fetchMediumText(api));
+	} catch (err) {
+		if (/locked or has expired/.test(err.message)) throw err;
+		process.stderr.write(
+			`Medium API request failed (${err.message}); retrying in Chromium\n`
+		);
+		post = parseMediumPost(await fetchMediumTextWithBrowser(api, options));
+	}
+
+	const paragraphs = post.content.bodyModel.paragraphs;
+	const html = renderMediumPage(post, paragraphs, raw);
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'percollate-'));
+	const file = path.join(dir, 'page.html');
+	await fs.promises.writeFile(file, html);
+	return { file, dir, url: raw };
+}
+
+async function removeDirs(dirs) {
+	for (const dir of dirs) {
+		await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+	}
+}
+
+/*
+ * Turn an article title into a file name: strip accents, drop quotes, and
+ * replace every run of other characters (spaces included) with a single "-".
+ * "Don’t Panic: A Guide" becomes "Dont-Panic-A-Guide".
+ */
+function slugifyTitle(raw) {
+	return String(raw || '')
+		.normalize('NFKD')
+		.replace(/[\u0300-\u036f]/g, '')
+		.replace(/['’`]/g, '')
+		.replace(/[^A-Za-z0-9]+/g, '-')
+		.replace(/-{2,}/g, '-')
+		.replace(/^-+|-+$/g, '')
+		.slice(0, 80)
+		.replace(/-+$/, '');
+}
+
+/* Append -2, -3, … when a file with that name is already in the directory. */
+function uniqueName(dir, base, ext) {
+	let name = `${base}${ext}`;
+	let n = 2;
+	while (fs.existsSync(path.join(dir, name))) {
+		name = `${base}-${n}${ext}`;
+		n += 1;
+	}
+	return name;
+}
+
+/*
+ * percollate is told to write "<job-id>.<ext>" ("<job-id>-<slug>.<ext>" for
+ * individual files). After it has run we know the article title(s), so rename
+ * the output after the title and report the final name back to the server.
+ */
+function renameOutput(job, result) {
+	const ext = path.extname(job.options.output);
+	const dir = path.dirname(job.options.output);
+	const jobBase = path.basename(job.options.output, ext);
+	const items = result?.items || [];
+	let filename = path.basename(job.options.output);
+
+	if (job.options.individual) {
+		const prefix = `${jobBase}-`;
+		const renamed = fs
+			.readdirSync(dir)
+			.filter(f => f.startsWith(prefix) && f.endsWith(ext))
+			.map(f => {
+				const base = path.basename(f, ext).slice(prefix.length);
+				const target = uniqueName(dir, slugifyTitle(base) || jobBase, ext);
+				fs.renameSync(path.join(dir, f), path.join(dir, target));
+				return target;
+			});
+		if (renamed.length) filename = renamed[0];
+		return filename;
+	}
+
+	let base = slugifyTitle(job.options.title || items[0]?.title);
+	if (!base) {
+		base = jobBase;
+	} else if (items.length > 1 && !job.options.title) {
+		base += `-and-${items.length - 1}-more`;
+	}
+
+	const source = path.join(dir, path.basename(job.options.output));
+	if (fs.existsSync(source)) {
+		filename = uniqueName(dir, base, ext);
+		fs.renameSync(source, path.join(dir, filename));
+	}
+	return filename;
+}
+
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => {
 	spec += chunk;
 });
 process.stdin.on('end', async () => {
+	const tempDirs = [];
 	try {
 		const job = JSON.parse(spec);
 		const fn = FORMATS[job.format];
 		if (!fn) throw new Error(`Unknown format: ${job.format}`);
-		await fn(job.urls, job.options);
-		process.stdout.write('\n{"ok":true}\n');
+
+		// Medium friend links (?sk=…) unlock the story through Medium's own
+		// JSON API. Build a local HTML copy from that response so percollate
+		// sees the full article instead of the paywalled preview.
+		const urls = [...job.urls];
+		const preferredUrls = [];
+		for (let i = 0; i < urls.length; i++) {
+			if (!mediumPostId(urls[i])) continue;
+			process.stderr.write(`Fetching Medium friend link: ${urls[i]}\n`);
+			try {
+				const fetched = await fetchMediumPost(urls[i], job.options);
+				urls[i] = fetched.file;
+				preferredUrls[i] = fetched.url;
+				tempDirs.push(fetched.dir);
+				process.stderr.write('Friend link unlocked via Medium API\n');
+			} catch (err) {
+				process.stderr.write(
+					`Friend-link fetch failed (${err.message}); using direct fetch\n`
+				);
+			}
+		}
+
+		const runOptions = { ...job.options };
+		// percollate uses options.url[i] as the base URL when the input is a
+		// local file, so relative images/links still resolve to the article.
+		if (preferredUrls.some(Boolean)) runOptions.url = preferredUrls;
+
+		const result = await fn(urls, runOptions);
+		const filename = renameOutput(job, result);
+		await removeDirs(tempDirs);
+		process.stderr.write(`Saved as: ${filename}\n`);
+		process.stdout.write(`\n${JSON.stringify({ ok: true, filename })}\n`);
 		process.exit(0);
 	} catch (err) {
+		await removeDirs(tempDirs);
 		const msg = String((err && err.stack) || err || 'Unknown error');
 		process.stdout.write(`\n{"ok":false,"error":${JSON.stringify(msg)}}\n`);
 		process.exit(1);
@@ -1829,6 +2845,12 @@ cat >package.json <<NPM_MANIFEST
 }
 NPM_MANIFEST
 PUPPETEER_SKIP_DOWNLOAD=true $STD npm install --no-audit --no-fund
+# Make percollate's user-agent overridable via PERCOLLATE_USER_AGENT (set by
+# server.js): its hard-coded "percollate/<version>" UA is rejected with HTTP 403
+# by Cloudflare-protected sites such as itnext.io/Medium, yielding empty output.
+if grep -q 'let UA = `percollate/${pkg.version}`;' node_modules/percollate/index.js 2>/dev/null; then
+  sed -i 's#^let UA = `percollate/${pkg.version}`;#let UA = process.env.PERCOLLATE_USER_AGENT || `percollate/${pkg.version}`;#' node_modules/percollate/index.js
+fi
 }
 
 function update_script() {
