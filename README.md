@@ -21,13 +21,17 @@ GitHub: the install fragment *and* the entire `web-ui/` (server.js, worker.js,
 The only network dependency for "obtaining a version" is the official
 `danburzo/percollate` GitHub API, read at install time.
 
-This build also adds two worker-level improvements:
+This build also adds three worker-level improvements:
 
 - **Readable output names** — generated files are renamed after the article
   title (spaces become `-`) instead of keeping the internal job id.
 - **Medium friend links** — URLs containing a Medium `?sk=` share key are
   fetched through Medium's article API, so non-members get the full story
   instead of the paywalled preview.
+- **Kindle-friendly EPUB images** — the **Optimized for Kindle** checkbox (on
+  by default) shrinks raster images to fit a Paperwhite screen, converts them
+  to grayscale, and re-encodes them as JPEG, which cuts EPUB size dramatically
+  for e-ink reading.
 
 ## Usage
 
@@ -107,6 +111,37 @@ friend key, and Medium returns the full body only while that key is valid.
 
 If the share key is expired or revoked, or the API cannot be reached, the
 worker logs the reason and falls back to percollate's normal direct fetch.
+
+## Kindle / e-ink image optimization
+
+The web UI has an **Optimized for Kindle** checkbox (enabled by default). When
+it is ticked for an `epub` job, the worker rewrites every raster image inside
+the finished EPUB: a shrink-only resize to 1200×1600 (a Kindle Paperwhite 11th
+gen screen is 1236×1648), transparency flattened onto white, 8-bit grayscale,
+and a baseline JPEG re-encode at quality 82. KOReader shows a tapped image in
+its own full-screen view, so anything above the screen resolution is wasted
+bytes. SVGs stay vector, and any image that would grow after re-encoding is
+left untouched.
+
+Untick it to keep the original image bytes. The checkbox is disabled when the
+format is not EPUB, and API callers can pass `"kindle": false` in the options
+object to get the same behaviour.
+
+Tune the limits in the systemd unit
+(`/etc/systemd/system/percollate.service`) and restart:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `EPUB_IMAGE_MAX_WIDTH` | `1200` | Max width in pixels (never upscales) |
+| `EPUB_IMAGE_MAX_HEIGHT` | `1600` | Max height in pixels |
+| `EPUB_IMAGE_QUALITY` | `82` | JPEG quality (1–100) |
+
+```sh
+systemctl daemon-reload && systemctl restart percollate
+```
+
+The feature relies on the `sharp` and `jszip` npm packages, which the installer
+adds to `package.json`. PDF, HTML, and Markdown output are not affected.
 
 ## Native stack
 
