@@ -158,7 +158,7 @@ function validUrl(raw) {
 function sanitizeOptions(o) {
 	const opt = { ...(o || {}) };
 	const names = new Set([
-		'title', 'author', 'individual', 'inline', 'toc', 'toc-level',
+		'title', 'author', 'individual', 'inline', 'kindle', 'toc', 'toc-level',
 		'hyphenate', 'cover', 'css', 'wait', 'amp', 'unsafe', 'debug', 'sandbox'
 	]);
 	for (const k of Object.keys(opt)) {
@@ -870,6 +870,177 @@ async function removeDirs(dirs) {
 }
 
 /*
+ * E-ink / Kindle image optimization for EPUB output.
+ *
+ * percollate embeds images at their original size and in their original
+ * colour, which is the main reason EPUBs get huge. Kindle Paperwhite (11th
+ * gen) is 1236x1648 px; KOReader shows a tapped image in its own full-screen
+ * view, so anything above that resolution is wasted. We shrink (never upscale),
+ * drop colour, and re-encode as baseline grayscale JPEG, then repack the EPUB.
+ * Images that would grow are left untouched; SVGs stay vectors.
+ *
+ * Tune with EPUB_IMAGE_MAX_WIDTH / EPUB_IMAGE_MAX_HEIGHT / EPUB_IMAGE_QUALITY.
+ */
+const IMAGE_MAX_WIDTH = positiveInt(process.env.EPUB_IMAGE_MAX_WIDTH, 1200);
+const IMAGE_MAX_HEIGHT = positiveInt(process.env.EPUB_IMAGE_MAX_HEIGHT, 1600);
+const IMAGE_QUALITY = clamp(positiveInt(process.env.EPUB_IMAGE_QUALITY, 82), 1, 100);
+const RASTER_IMAGE_RE = /\.(?:jpe?g|png|gif|webp|bmp|tiff?|avif)$/i;
+
+function positiveInt(value, fallback) {
+	const n = Number.parseInt(value, 10);
+	return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function clamp(n, min, max) {
+	return Math.min(max, Math.max(min, n));
+}
+
+function escapeRegExp(value) {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function optimizeEpub(file) {
+	let sharp, JSZip;
+	try {
+		({ default: sharp } = await import('sharp'));
+		({ default: JSZip } = await import('jszip'));
+	} catch (err) {
+		process.stderr.write(`Image optimization skipped (${err.message})\n`);
+		return;
+	}
+
+	let zip;
+	try {
+		zip = await JSZip.loadAsync(await fs.promises.readFile(file));
+	} catch (err) {
+		process.stderr.write(`Image optimization skipped (${err.message})\n`);
+		return;
+	}
+
+	const names = Object.keys(zip.files);
+	const replacements = new Map();
+	let converted = 0;
+
+	for (const name of names) {
+		const entry = zip.files[name];
+		if (entry.dir || !RASTER_IMAGE_RE.test(name)) continue;
+		const source = await entry.async('nodebuffer');
+		try {
+			const output = await sharp(source)
+				.rotate()
+				.resize({
+					width: IMAGE_MAX_WIDTH,
+					height: IMAGE_MAX_HEIGHT,
+					fit: 'inside',
+					withoutEnlargement: true
+				})
+				.flatten({ background: '#ffffff' })
+				.greyscale()
+				.toColourspace('b-w')
+				.jpeg({ quality: IMAGE_QUALITY, mozjpeg: true })
+				.toBuffer();
+			if (output.length >= source.length) continue;
+			replacements.set(name, {
+				name: name.replace(RASTER_IMAGE_RE, '.jpg'),
+				data: output
+			});
+			converted += 1;
+		} catch {
+			// Corrupt or unsupported image: keep what percollate fetched.
+		}
+	}
+
+	if (!converted) return;
+
+	/*
+	 * When a file changes extension the XHTML <img src> and the OPF manifest
+	 * entry must follow, otherwise readers lose the image (or get a MIME
+	 * mismatch). Build a basename map and rewrite both.
+	 */
+	const renames = new Map();
+	for (const [oldName, replacement] of replacements) {
+		const oldBase = path.posix.basename(oldName);
+		const newBase = path.posix.basename(replacement.name);
+		if (oldBase !== newBase) renames.set(oldBase, newBase);
+	}
+
+	const out = new JSZip();
+	const mimetype = zip.files.mimetype
+		? await zip.files.mimetype.async('string')
+		: 'application/epub+zip';
+	// EPUB requires `mimetype` first and uncompressed.
+	out.file('mimetype', mimetype, { compression: 'STORE' });
+
+	for (const name of names) {
+		const entry = zip.files[name];
+		if (name === 'mimetype') continue;
+		if (entry.dir) {
+			out.folder(name);
+			continue;
+		}
+
+		const replacement = replacements.get(name);
+		let data = replacement ? replacement.data : await entry.async('nodebuffer');
+		const target = replacement ? replacement.name : name;
+
+		if (/\.(?:xhtml|html|opf|ncx)$/i.test(target)) {
+			let text = data.toString('utf8');
+			for (const [oldBase, newBase] of renames) {
+				const escaped = escapeRegExp(oldBase);
+				// Manifest entries carry href + media-type on the same <item>.
+				text = text.replace(
+					new RegExp(`href="${escaped}"([^>]*?)media-type="[^"]*"`, 'g'),
+					`href="${newBase}"$1media-type="image/jpeg"`
+				);
+				// Remaining references (XHTML <img src>, …).
+				text = text.split(oldBase).join(newBase);
+			}
+			data = Buffer.from(text, 'utf8');
+		}
+
+		// Images are already compressed; storing them saves CPU without size cost.
+		const stored = /\.(?:jpe?g|png|gif|webp|avif)$/i.test(target);
+		out.file(target, data, {
+			compression: stored ? 'STORE' : 'DEFLATE',
+			compressionOptions: { level: 9 }
+		});
+	}
+
+	await fs.promises.writeFile(
+		file,
+		await out.generateAsync({ type: 'nodebuffer' })
+	);
+	process.stderr.write(
+		`Optimized ${converted} image(s) for e-ink (max ${IMAGE_MAX_WIDTH}x${IMAGE_MAX_HEIGHT}, q${IMAGE_QUALITY})\n`
+	);
+}
+
+async function optimizeEpubOutputs(job) {
+	const ext = path.extname(job.options.output);
+	const dir = path.dirname(job.options.output);
+	const base = path.basename(job.options.output, ext);
+	let files;
+	if (job.options.individual) {
+		const prefix = `${base}-`;
+		files = fs
+			.readdirSync(dir)
+			.filter(f => f.startsWith(prefix) && f.endsWith(ext))
+			.map(f => path.join(dir, f));
+	} else {
+		files = [job.options.output];
+	}
+	for (const file of files) {
+		try {
+			await optimizeEpub(file);
+		} catch (err) {
+			process.stderr.write(
+				`Image optimization failed for ${path.basename(file)}: ${err.message}\n`
+			);
+		}
+	}
+}
+
+/*
  * Turn an article title into a file name: strip accents, drop quotes, and
  * replace every run of other characters (spaces included) with a single "-".
  * "Don’t Panic: A Guide" becomes "Dont-Panic-A-Guide".
@@ -977,6 +1148,7 @@ process.stdin.on('end', async () => {
 		if (preferredUrls.some(Boolean)) runOptions.url = preferredUrls;
 
 		const result = await fn(urls, runOptions);
+		if (job.format === 'epub' && job.options.kindle !== false) await optimizeEpubOutputs(job);
 		const filename = renameOutput(job, result);
 		await removeDirs(tempDirs);
 		process.stderr.write(`Saved as: ${filename}\n`);
@@ -1034,6 +1206,7 @@ cat >/opt/percollate/public/index.html <<'PERCOLLATE_UI_BELOW'
 				<div class="checks">
 					<label title="One file per URL"><input type="checkbox" id="opt_individual" /> Individual files</label>
 					<label title="Embed images instead of referencing them"><input type="checkbox" id="opt_inline" /> Embed images inline</label>
+					<label title="Resize and grayscale EPUB images for Kindle/e-ink screens"><input type="checkbox" id="opt_kindle" checked /> Optimized for Kindle</label>
 					<label title="Generate a table of contents (default for multiple URLs)"><input type="checkbox" id="opt_toc" /> Table of contents</label>
 					<label title="Justify/typographically-hyphenate text (PDF default)"><input type="checkbox" id="opt_hyphenate" /> Hyphenate</label>
 					<label title="Fetch AMP version when available (default prefers it)"><input type="checkbox" id="opt_amp" checked /> Prefer AMP</label>
@@ -1074,6 +1247,23 @@ const form = $('form');
 const jobBox = $('job');
 const download = $('download');
 let pollTimer = null;
+
+const formatSelect = $('format');
+const kindleInput = $('opt_kindle');
+const kindleLabel = kindleInput.closest('label');
+
+/* The e-ink image pass only runs for EPUB output. */
+function syncKindleOption() {
+	const isEpub = formatSelect.value === 'epub';
+	kindleInput.disabled = !isEpub;
+	kindleLabel.classList.toggle('disabled', !isEpub);
+	kindleLabel.title = isEpub
+		? 'Resize and grayscale EPUB images for Kindle/e-ink screens'
+		: 'Only applies to EPUB output';
+}
+
+formatSelect.addEventListener('change', syncKindleOption);
+syncKindleOption();
 
 function setStatus(msg, isError = false) {
 	const el = $('status');
@@ -1182,6 +1372,7 @@ form.addEventListener('submit', async ev => {
 		author: $('author').value.trim() || undefined,
 		individual: $('opt_individual').checked,
 		inline: $('opt_inline').checked,
+		kindle: kindleInput.checked,
 		toc: $('opt_toc').checked || undefined,
 		hyphenate: $('opt_hyphenate').checked || undefined,
 		amp: $('opt_amp').checked,
@@ -1306,6 +1497,7 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, C
 }
 
 .checks label { display: inline-flex; gap: 6px; align-items: center; user-select: none; }
+.checks label.disabled { opacity: .55; }
 .checks input { width: auto; accent-color: var(--accent); }
 
 .row {
@@ -1390,7 +1582,9 @@ cat >package.json <<NPM_MANIFEST
   "type": "module",
   "description": "Web GUI for percollate (PDF/EPUB/HTML/MD conversion)",
   "dependencies": {
-    "percollate": "${PERCOLLATE_VERSION}"
+    "percollate": "${PERCOLLATE_VERSION}",
+    "sharp": "^0.35.5",
+    "jszip": "^3.10.2"
   },
   "overrides": {
     "puppeteer": "25.10.0",
@@ -1601,7 +1795,7 @@ function validUrl(raw) {
 function sanitizeOptions(o) {
 	const opt = { ...(o || {}) };
 	const names = new Set([
-		'title', 'author', 'individual', 'inline', 'toc', 'toc-level',
+		'title', 'author', 'individual', 'inline', 'kindle', 'toc', 'toc-level',
 		'hyphenate', 'cover', 'css', 'wait', 'amp', 'unsafe', 'debug', 'sandbox'
 	]);
 	for (const k of Object.keys(opt)) {
@@ -2313,6 +2507,177 @@ async function removeDirs(dirs) {
 }
 
 /*
+ * E-ink / Kindle image optimization for EPUB output.
+ *
+ * percollate embeds images at their original size and in their original
+ * colour, which is the main reason EPUBs get huge. Kindle Paperwhite (11th
+ * gen) is 1236x1648 px; KOReader shows a tapped image in its own full-screen
+ * view, so anything above that resolution is wasted. We shrink (never upscale),
+ * drop colour, and re-encode as baseline grayscale JPEG, then repack the EPUB.
+ * Images that would grow are left untouched; SVGs stay vectors.
+ *
+ * Tune with EPUB_IMAGE_MAX_WIDTH / EPUB_IMAGE_MAX_HEIGHT / EPUB_IMAGE_QUALITY.
+ */
+const IMAGE_MAX_WIDTH = positiveInt(process.env.EPUB_IMAGE_MAX_WIDTH, 1200);
+const IMAGE_MAX_HEIGHT = positiveInt(process.env.EPUB_IMAGE_MAX_HEIGHT, 1600);
+const IMAGE_QUALITY = clamp(positiveInt(process.env.EPUB_IMAGE_QUALITY, 82), 1, 100);
+const RASTER_IMAGE_RE = /\.(?:jpe?g|png|gif|webp|bmp|tiff?|avif)$/i;
+
+function positiveInt(value, fallback) {
+	const n = Number.parseInt(value, 10);
+	return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function clamp(n, min, max) {
+	return Math.min(max, Math.max(min, n));
+}
+
+function escapeRegExp(value) {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function optimizeEpub(file) {
+	let sharp, JSZip;
+	try {
+		({ default: sharp } = await import('sharp'));
+		({ default: JSZip } = await import('jszip'));
+	} catch (err) {
+		process.stderr.write(`Image optimization skipped (${err.message})\n`);
+		return;
+	}
+
+	let zip;
+	try {
+		zip = await JSZip.loadAsync(await fs.promises.readFile(file));
+	} catch (err) {
+		process.stderr.write(`Image optimization skipped (${err.message})\n`);
+		return;
+	}
+
+	const names = Object.keys(zip.files);
+	const replacements = new Map();
+	let converted = 0;
+
+	for (const name of names) {
+		const entry = zip.files[name];
+		if (entry.dir || !RASTER_IMAGE_RE.test(name)) continue;
+		const source = await entry.async('nodebuffer');
+		try {
+			const output = await sharp(source)
+				.rotate()
+				.resize({
+					width: IMAGE_MAX_WIDTH,
+					height: IMAGE_MAX_HEIGHT,
+					fit: 'inside',
+					withoutEnlargement: true
+				})
+				.flatten({ background: '#ffffff' })
+				.greyscale()
+				.toColourspace('b-w')
+				.jpeg({ quality: IMAGE_QUALITY, mozjpeg: true })
+				.toBuffer();
+			if (output.length >= source.length) continue;
+			replacements.set(name, {
+				name: name.replace(RASTER_IMAGE_RE, '.jpg'),
+				data: output
+			});
+			converted += 1;
+		} catch {
+			// Corrupt or unsupported image: keep what percollate fetched.
+		}
+	}
+
+	if (!converted) return;
+
+	/*
+	 * When a file changes extension the XHTML <img src> and the OPF manifest
+	 * entry must follow, otherwise readers lose the image (or get a MIME
+	 * mismatch). Build a basename map and rewrite both.
+	 */
+	const renames = new Map();
+	for (const [oldName, replacement] of replacements) {
+		const oldBase = path.posix.basename(oldName);
+		const newBase = path.posix.basename(replacement.name);
+		if (oldBase !== newBase) renames.set(oldBase, newBase);
+	}
+
+	const out = new JSZip();
+	const mimetype = zip.files.mimetype
+		? await zip.files.mimetype.async('string')
+		: 'application/epub+zip';
+	// EPUB requires `mimetype` first and uncompressed.
+	out.file('mimetype', mimetype, { compression: 'STORE' });
+
+	for (const name of names) {
+		const entry = zip.files[name];
+		if (name === 'mimetype') continue;
+		if (entry.dir) {
+			out.folder(name);
+			continue;
+		}
+
+		const replacement = replacements.get(name);
+		let data = replacement ? replacement.data : await entry.async('nodebuffer');
+		const target = replacement ? replacement.name : name;
+
+		if (/\.(?:xhtml|html|opf|ncx)$/i.test(target)) {
+			let text = data.toString('utf8');
+			for (const [oldBase, newBase] of renames) {
+				const escaped = escapeRegExp(oldBase);
+				// Manifest entries carry href + media-type on the same <item>.
+				text = text.replace(
+					new RegExp(`href="${escaped}"([^>]*?)media-type="[^"]*"`, 'g'),
+					`href="${newBase}"$1media-type="image/jpeg"`
+				);
+				// Remaining references (XHTML <img src>, …).
+				text = text.split(oldBase).join(newBase);
+			}
+			data = Buffer.from(text, 'utf8');
+		}
+
+		// Images are already compressed; storing them saves CPU without size cost.
+		const stored = /\.(?:jpe?g|png|gif|webp|avif)$/i.test(target);
+		out.file(target, data, {
+			compression: stored ? 'STORE' : 'DEFLATE',
+			compressionOptions: { level: 9 }
+		});
+	}
+
+	await fs.promises.writeFile(
+		file,
+		await out.generateAsync({ type: 'nodebuffer' })
+	);
+	process.stderr.write(
+		`Optimized ${converted} image(s) for e-ink (max ${IMAGE_MAX_WIDTH}x${IMAGE_MAX_HEIGHT}, q${IMAGE_QUALITY})\n`
+	);
+}
+
+async function optimizeEpubOutputs(job) {
+	const ext = path.extname(job.options.output);
+	const dir = path.dirname(job.options.output);
+	const base = path.basename(job.options.output, ext);
+	let files;
+	if (job.options.individual) {
+		const prefix = `${base}-`;
+		files = fs
+			.readdirSync(dir)
+			.filter(f => f.startsWith(prefix) && f.endsWith(ext))
+			.map(f => path.join(dir, f));
+	} else {
+		files = [job.options.output];
+	}
+	for (const file of files) {
+		try {
+			await optimizeEpub(file);
+		} catch (err) {
+			process.stderr.write(
+				`Image optimization failed for ${path.basename(file)}: ${err.message}\n`
+			);
+		}
+	}
+}
+
+/*
  * Turn an article title into a file name: strip accents, drop quotes, and
  * replace every run of other characters (spaces included) with a single "-".
  * "Don’t Panic: A Guide" becomes "Dont-Panic-A-Guide".
@@ -2420,6 +2785,7 @@ process.stdin.on('end', async () => {
 		if (preferredUrls.some(Boolean)) runOptions.url = preferredUrls;
 
 		const result = await fn(urls, runOptions);
+		if (job.format === 'epub' && job.options.kindle !== false) await optimizeEpubOutputs(job);
 		const filename = renameOutput(job, result);
 		await removeDirs(tempDirs);
 		process.stderr.write(`Saved as: ${filename}\n`);
@@ -2477,6 +2843,7 @@ cat >/opt/percollate/public/index.html <<'PERCOLLATE_UI_BELOW'
 				<div class="checks">
 					<label title="One file per URL"><input type="checkbox" id="opt_individual" /> Individual files</label>
 					<label title="Embed images instead of referencing them"><input type="checkbox" id="opt_inline" /> Embed images inline</label>
+					<label title="Resize and grayscale EPUB images for Kindle/e-ink screens"><input type="checkbox" id="opt_kindle" checked /> Optimized for Kindle</label>
 					<label title="Generate a table of contents (default for multiple URLs)"><input type="checkbox" id="opt_toc" /> Table of contents</label>
 					<label title="Justify/typographically-hyphenate text (PDF default)"><input type="checkbox" id="opt_hyphenate" /> Hyphenate</label>
 					<label title="Fetch AMP version when available (default prefers it)"><input type="checkbox" id="opt_amp" checked /> Prefer AMP</label>
@@ -2517,6 +2884,23 @@ const form = $('form');
 const jobBox = $('job');
 const download = $('download');
 let pollTimer = null;
+
+const formatSelect = $('format');
+const kindleInput = $('opt_kindle');
+const kindleLabel = kindleInput.closest('label');
+
+/* The e-ink image pass only runs for EPUB output. */
+function syncKindleOption() {
+	const isEpub = formatSelect.value === 'epub';
+	kindleInput.disabled = !isEpub;
+	kindleLabel.classList.toggle('disabled', !isEpub);
+	kindleLabel.title = isEpub
+		? 'Resize and grayscale EPUB images for Kindle/e-ink screens'
+		: 'Only applies to EPUB output';
+}
+
+formatSelect.addEventListener('change', syncKindleOption);
+syncKindleOption();
 
 function setStatus(msg, isError = false) {
 	const el = $('status');
@@ -2625,6 +3009,7 @@ form.addEventListener('submit', async ev => {
 		author: $('author').value.trim() || undefined,
 		individual: $('opt_individual').checked,
 		inline: $('opt_inline').checked,
+		kindle: kindleInput.checked,
 		toc: $('opt_toc').checked || undefined,
 		hyphenate: $('opt_hyphenate').checked || undefined,
 		amp: $('opt_amp').checked,
@@ -2749,6 +3134,7 @@ textarea { resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, C
 }
 
 .checks label { display: inline-flex; gap: 6px; align-items: center; user-select: none; }
+.checks label.disabled { opacity: .55; }
 .checks input { width: auto; accent-color: var(--accent); }
 
 .row {
@@ -2833,7 +3219,9 @@ cat >package.json <<NPM_MANIFEST
   "type": "module",
   "description": "Web GUI for percollate (PDF/EPUB/HTML/MD conversion)",
   "dependencies": {
-    "percollate": "${PERCOLLATE_VERSION}"
+    "percollate": "${PERCOLLATE_VERSION}",
+    "sharp": "^0.35.5",
+    "jszip": "^3.10.2"
   },
   "overrides": {
     "puppeteer": "25.10.0",
