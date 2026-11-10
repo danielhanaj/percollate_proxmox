@@ -1,7 +1,6 @@
 # percollate-proxmox
 
-<img width="753" height="691" alt="image" src="https://github.com/user-attachments/assets/1fe3ad6b-a00f-4c09-8191-4c2ecd8e8007" />
-
+<img width="733" height="710" alt="image" src="https://github.com/user-attachments/assets/87854f4b-f2f2-40cf-9113-fa08ff530ace" />
 
 [Percollate](https://github.com/danburzo/percollate) is a command-line tool
 that grabs web pages from (one or more) URLs and bundles them into a
